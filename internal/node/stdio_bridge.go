@@ -75,7 +75,6 @@ func (b *StdioBridge) Start() {
 
 		b.mu.Lock()
 		for ch := range b.clients {
-			close(ch)
 			delete(b.clients, ch)
 		}
 		for _, ch := range b.calls {

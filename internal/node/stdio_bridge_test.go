@@ -160,3 +160,45 @@ func TestStdioBridge_ServeHTTP_POSTCallWaitsForMatchingReply(t *testing.T) {
 		t.Fatalf("body = %q, want %q", got, reply)
 	}
 }
+
+func TestStdioBridge_ServeHTTP_GETScannerShutdownAndCancelNoPanic(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		b, stdoutWriter, _ := newPipeBridge()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+		rec := &writeSignalRecorder{ResponseRecorder: httptest.NewRecorder(), wrote: make(chan struct{}, 1)}
+
+		done := make(chan struct{})
+		go func() {
+			b.ServeHTTP(rec, req)
+			close(done)
+		}()
+
+		waitFor(t, "SSE client registration", func() bool {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			return len(b.clients) > 0
+		})
+
+		closeDone := make(chan struct{})
+		go func() {
+			_ = stdoutWriter.Close()
+			close(closeDone)
+		}()
+
+		cancel()
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("ServeHTTP did not return after scanner shutdown and ctx cancellation")
+		}
+
+		select {
+		case <-closeDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("stdout writer close did not complete")
+		}
+	}
+}
