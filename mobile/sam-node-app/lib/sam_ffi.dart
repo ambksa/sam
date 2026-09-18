@@ -33,6 +33,22 @@ typedef ReEnrollNodeC = ffi.Pointer<Utf8> Function(
 typedef ReEnrollNodeDart = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8> dataDir, ffi.Pointer<Utf8> labels);
 
+typedef EnrollNodeBootstrapC = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8> dataDir,
+    ffi.Pointer<Utf8> controlPlaneURL,
+    ffi.Pointer<Utf8> bootstrapToken,
+    ffi.Int8 allowLoopback,
+    ffi.Pointer<Utf8> labels);
+typedef EnrollNodeBootstrapDart = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8> dataDir,
+    ffi.Pointer<Utf8> controlPlaneURL,
+    ffi.Pointer<Utf8> bootstrapToken,
+    int allowLoopback,
+    ffi.Pointer<Utf8> labels);
+
+typedef UnenrollNodeC = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8> dataDir);
+typedef UnenrollNodeDart = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8> dataDir);
+
 typedef FetchControlPlaneInfoJSONC = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8> controlPlaneURL);
 typedef FetchControlPlaneInfoJSONDart = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8> controlPlaneURL);
 
@@ -52,6 +68,8 @@ class SamNodeLib {
   late GetNodeIDDart _getNodeID;
   late EnrollNodeDart _enrollNode;
   late ReEnrollNodeDart _reEnrollNode;
+  late EnrollNodeBootstrapDart _enrollNodeBootstrap;
+  late UnenrollNodeDart _unenrollNode;
   late FetchControlPlaneInfoJSONDart _fetchControlPlaneInfoJSON;
   late IsEnrolledDart _isEnrolled;
   late GetMeshInfoDart _getMeshInfo;
@@ -71,6 +89,8 @@ class SamNodeLib {
     _getNodeID = _dylib.lookupFunction<GetNodeIDC, GetNodeIDDart>('GetNodeID');
     _enrollNode = _dylib.lookupFunction<EnrollNodeC, EnrollNodeDart>('EnrollNode');
     _reEnrollNode = _dylib.lookupFunction<ReEnrollNodeC, ReEnrollNodeDart>('ReEnrollNode');
+    _enrollNodeBootstrap = _dylib.lookupFunction<EnrollNodeBootstrapC, EnrollNodeBootstrapDart>('EnrollNodeBootstrap');
+    _unenrollNode = _dylib.lookupFunction<UnenrollNodeC, UnenrollNodeDart>('UnenrollNode');
     _fetchControlPlaneInfoJSON = _dylib.lookupFunction<FetchControlPlaneInfoJSONC, FetchControlPlaneInfoJSONDart>('FetchControlPlaneInfoJSON');
     _isEnrolled = _dylib.lookupFunction<IsEnrolledC, IsEnrolledDart>('IsEnrolled');
     _getMeshInfo = _dylib.lookupFunction<GetMeshInfoC, GetMeshInfoDart>('GetMeshInfo');
@@ -134,6 +154,43 @@ class SamNodeLib {
     final cErr = _reEnrollNode(cDataDir, cLabels);
 
     calloc.free(cDataDir);
+    calloc.free(cLabels);
+
+    if (cErr.address == 0) return null;
+    final goErr = cErr.toDartString();
+    _freeString(cErr);
+    return goErr;
+  }
+
+  /// Clears the stored mesh identity, keeping the key behind the PeerID.
+  String? unenroll(String dataDir) {
+    final cDataDir = dataDir.toNativeUtf8();
+
+    final cErr = _unenrollNode(cDataDir);
+
+    calloc.free(cDataDir);
+
+    if (cErr.address == 0) return null;
+    final goErr = cErr.toDartString();
+    _freeString(cErr);
+    return goErr;
+  }
+
+  /// Enrolls with a bootstrap token through POST /enroll; no identity
+  /// provider is involved. A single-use token is burned by this call.
+  String? enrollBootstrap(String dataDir, String controlPlaneURL,
+      String bootstrapToken, bool allowLoopback, String labels) {
+    final cDataDir = dataDir.toNativeUtf8();
+    final cControlPlaneURL = controlPlaneURL.toNativeUtf8();
+    final cToken = bootstrapToken.toNativeUtf8();
+    final cLabels = labels.toNativeUtf8();
+
+    final cErr = _enrollNodeBootstrap(
+        cDataDir, cControlPlaneURL, cToken, allowLoopback ? 1 : 0, cLabels);
+
+    calloc.free(cDataDir);
+    calloc.free(cControlPlaneURL);
+    calloc.free(cToken);
     calloc.free(cLabels);
 
     if (cErr.address == 0) return null;

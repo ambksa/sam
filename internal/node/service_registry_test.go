@@ -110,6 +110,43 @@ func TestServiceRegistry_InitErrorBlocksProvideAndInsertion(t *testing.T) {
 	}
 }
 
+// H2: policy is evaluated on type://name and the registry was keyed on name
+// alone, so a peer granted a2a://reports reached mcp://reports. A name now
+// belongs to one type, and dispatch looks it up under the granted type.
+func TestServiceRegistry_OneNameOneType(t *testing.T) {
+	r := newServiceRegistryForTest(&fakeDHT{})
+	ctx := context.Background()
+
+	mcpSvc := newFakeSvc("reports", api.ServiceType_SERVICE_TYPE_MCP)
+	if err := r.Register(ctx, mcpSvc); err != nil {
+		t.Fatalf("Register mcp://reports: %v", err)
+	}
+
+	a2aSvc := newFakeSvc("reports", api.ServiceType_SERVICE_TYPE_A2A)
+	if err := r.Register(ctx, a2aSvc); err == nil {
+		t.Fatal("a2a://reports registered beside mcp://reports")
+	}
+	if a2aSvc.initCalls != 0 {
+		t.Error("the refused service was initialised")
+	}
+	if svc, _ := r.Get("reports"); svc != mcpSvc {
+		t.Error("the refused registration replaced the existing service")
+	}
+
+	// Re-registering the same name under the same type is the normal
+	// re-declare path and stays allowed.
+	if err := r.Register(ctx, newFakeSvc("reports", api.ServiceType_SERVICE_TYPE_MCP)); err != nil {
+		t.Errorf("same-type re-registration refused: %v", err)
+	}
+
+	if _, ok := r.GetTyped(api.ServiceType_SERVICE_TYPE_MCP, "reports"); !ok {
+		t.Error("GetTyped(mcp, reports) missed the registered service")
+	}
+	if _, ok := r.GetTyped(api.ServiceType_SERVICE_TYPE_A2A, "reports"); ok {
+		t.Error("GetTyped(a2a, reports) returned the mcp service: a grant for one type would reach the other")
+	}
+}
+
 func TestServiceRegistry_UnregisterRemovesAndCallsTeardown(t *testing.T) {
 	dht := &fakeDHT{}
 	r := newServiceRegistryForTest(dht)
@@ -357,4 +394,32 @@ func TestServiceRegistry_BackendProbeTimeoutIsConfigurable(t *testing.T) {
 			}
 		}
 	})
+}
+
+// registering the name again replaces the entry, so the displaced instance is
+// only reachable if this call tears it down
+func TestServiceRegistry_ReplacingServiceTearsDownPrevious(t *testing.T) {
+	r := newServiceRegistryForTest(&fakeDHT{})
+	ctx := context.Background()
+
+	first := newFakeSvc("demo", api.ServiceType_SERVICE_TYPE_MCP)
+	if err := r.Register(ctx, first); err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+
+	second := newFakeSvc("demo", api.ServiceType_SERVICE_TYPE_MCP)
+	if err := r.Register(ctx, second); err != nil {
+		t.Fatalf("second Register: %v", err)
+	}
+
+	if first.teardownCalls != 1 {
+		t.Errorf("replaced service Teardown called %d times, want 1: "+
+			"the replaced instance is no longer reachable from the map, so nothing else can ever tear it down", first.teardownCalls)
+	}
+	if second.teardownCalls != 0 {
+		t.Errorf("replacement service Teardown called %d times, want 0", second.teardownCalls)
+	}
+	if got, ok := r.Get("demo"); !ok || got != Service(second) {
+		t.Error("registry should hold the replacement instance")
+	}
 }

@@ -1,16 +1,35 @@
-package com.example.sam_agent
+package dev.sammesh.connect
 
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import android.content.Intent
 import android.util.Log
 import android.content.Context
 
 class MainActivity : FlutterActivity() {
-    private val CHANNEL = "com.example.sam_agent/mesh_expose"
+    private val CHANNEL = "dev.sammesh.connect/mesh_expose"
+    private val ENROLL_LINK_CHANNEL = "dev.sammesh.connect/enroll_link"
+    private var enrollLinkChannel: MethodChannel? = null
+
+    // A sam://enroll link that arrived before Dart asked for it (cold start).
+    private var pendingEnrollLink: String? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        pendingEnrollLink = enrollLinkOf(intent)
+        enrollLinkChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, ENROLL_LINK_CHANNEL).also { channel ->
+            channel.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getInitialLink" -> {
+                        result.success(pendingEnrollLink)
+                        pendingEnrollLink = null
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
         
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
@@ -46,8 +65,10 @@ class MainActivity : FlutterActivity() {
                     val enabled = call.argument<Boolean>("enabled") ?: false
                     Log.d("SAM_NODE", "setExposeLocation: $enabled")
                     if (enabled) {
+                        // Coarse only: the tool promises an approximate position, so
+                        // the app must not hold a permission that could give more.
                         if (androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_COARSE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                            androidx.core.app.ActivityCompat.requestPermissions(this, arrayOf(android.Manifest.permission.ACCESS_COARSE_LOCATION, android.Manifest.permission.ACCESS_FINE_LOCATION), 1001)
+                            androidx.core.app.ActivityCompat.requestPermissions(this, arrayOf(android.Manifest.permission.ACCESS_COARSE_LOCATION), 1001)
                         }
                     }
                     result.success(true)
@@ -72,18 +93,18 @@ class MainActivity : FlutterActivity() {
                             result.success("{\"error\": \"Location permission not granted\"}")
                             return@setMethodCallHandler
                         }
-                        
-                        val hasFineLocation = androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+                        // Network provider only, and rounded to two decimals (about
+                        // a kilometre): a mesh peer gets the neighbourhood, not the
+                        // building, whatever the platform would hand this app.
                         val locationManager = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-                        val location: android.location.Location? = if (hasFineLocation) {
-                            locationManager.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER) 
-                                ?: locationManager.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
-                        } else {
+                        val location: android.location.Location? =
                             locationManager.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
-                        }
-                            
+
                         if (location != null) {
-                            result.success("{\"latitude\": ${location.latitude}, \"longitude\": ${location.longitude}}")
+                            val lat = coarsen(location.latitude)
+                            val lon = coarsen(location.longitude)
+                            result.success("{\"latitude\": $lat, \"longitude\": $lon, \"precision_km\": 1}")
                         } else {
                             result.success("{\"error\": \"No location available\"}")
                         }
@@ -96,5 +117,27 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+    }
+
+    // Two decimal places of a degree is roughly 1.1 km at the equator.
+    private fun coarsen(degrees: Double): Double = Math.round(degrees * 100.0) / 100.0
+
+    // singleTop: a link opened while the app is running lands here instead of
+    // in a new activity, so it is pushed to Dart rather than queued.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val link = enrollLinkOf(intent) ?: return
+        val channel = enrollLinkChannel
+        if (channel != null) {
+            channel.invokeMethod("onLink", link)
+        } else {
+            pendingEnrollLink = link
+        }
+    }
+
+    private fun enrollLinkOf(intent: Intent?): String? {
+        val data = intent?.data ?: return null
+        if (intent.action != Intent.ACTION_VIEW || data.scheme != "sam") return null
+        return data.toString()
     }
 }

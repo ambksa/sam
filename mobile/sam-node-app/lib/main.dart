@@ -8,7 +8,6 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_ai/firebase_ai.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -16,6 +15,8 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'sam_ffi.dart';
 import 'mcp_server.dart';
+import 'enroll_link.dart';
+import 'scan_page.dart';
 
 // Isolate.run lives in these top-level functions, not in State methods: a closure
 // there shares its context with sibling setState closures, so `this` and its
@@ -44,6 +45,25 @@ Future<String?> _isolatedReEnroll(String dataDir, String labelsText) => Isolate.
   }
 });
 
+Future<String?> _isolatedEnrollBootstrap(String dataDir, String server, String token, String labelsText) => Isolate.run(() {
+  try {
+    return SamNodeLib().enrollBootstrap(dataDir, server, token, true, labelsText);
+  } catch (e) {
+    return e.toString();
+  }
+});
+
+Future<String?> _isolatedUnenroll(String dataDir) => Isolate.run(() {
+  try {
+    return SamNodeLib().unenroll(dataDir);
+  } catch (e) {
+    return e.toString();
+  }
+});
+
+/// Unenroll keeps the PeerID; resetIdentity deletes the key behind it too.
+enum _UnenrollChoice { unenroll, resetIdentity }
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   try {
@@ -60,7 +80,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'SAM Node Control',
+      title: 'SAM Connect',
       theme: ThemeData(
         primarySwatch: Colors.blue,
         useMaterial3: true,
@@ -78,25 +98,46 @@ class NodeControlPage extends StatefulWidget {
 }
 
 class _NodeControlPageState extends State<NodeControlPage> {
-  final _controlPlaneController =
-      TextEditingController(text: 'https://bananas.sam-mesh.dev');
+  // No default: a pre-filled public testnet would let a mistap enroll the
+  // device somewhere the user never chose. The QR code, a pasted link or
+  // the user fills it in.
+  final _controlPlaneController = TextEditingController();
   final _jwtController = TextEditingController();
   // Saved by the FFI at enrollment so Re-enroll can skip the browser.
   String _refreshToken = '';
-  final _tokenController = TextEditingController(text: 'secret-token');
+  // Bootstrap token typed or pasted by hand; a pasted sam://enroll link is
+  // accepted here too and fills the URL field.
+  final _joinTokenController = TextEditingController();
+  bool _manualEntry = false;
+  // A token-joined node cannot re-attest labels in place: /enroll re-mints
+  // from the labels already on record and there is no login session to
+  // refresh. Re-enroll is disabled for it; the marker dies with the data dir
+  // on unenroll.
+  static const _joinedWithTokenFile = 'joined-with-token';
+  bool _joinedWithToken = false;
+  // sam://enroll links delivered by MainActivity (stock camera app, browser).
+  static const _enrollLinkChannel = MethodChannel('dev.sammesh.connect/enroll_link');
+  // Bearer token for the sidecar API on 127.0.0.1:5005. Android loopback is
+  // shared by every installed app, so a fixed value would let any of them
+  // act as this node. Generated once and kept in the app-private data dir
+  // next to the identity it protects; shown on the Config tab.
+  static const _apiTokenFile = 'api-token';
+  String _apiToken = '';
+  bool _apiTokenVisible = false;
   // Labels are attested at enrollment; changing them requires re-enrolling.
   // The field is saved here after a successful enrollment and read back at
   // launch, like attenuation.json.
   static const _labelsFile = 'labels';
   final _labelsController = TextEditingController();
 
-  static const _exposeChannel = MethodChannel('com.example.sam_agent/mesh_expose');
+  static const _exposeChannel = MethodChannel('dev.sammesh.connect/mesh_expose');
 
   late SamNodeLib _samLib;
   bool?
       _isEnrolled; // null = checking, false = show enrollment, true = show dashboard
   bool _running = false;
-  String _status = 'Disconnected';
+  // Empty until something happens; the enrollment screen shows it as a card.
+  String _status = '';
   String _nodeID = '';
   int _connectedPeers = 0;
   int _dhtSize = 0;
@@ -129,7 +170,7 @@ class _NodeControlPageState extends State<NodeControlPage> {
   void initState() {
     super.initState();
     _samLib = SamNodeLib();
-    _checkEnrollment();
+    _checkEnrollment().then((_) => _listenForEnrollLinks());
     _embeddedMcpServer = SamDartMcpServer(
       isBatteryEnabled: () => _exposeBattery,
       isLocationEnabled: () => _exposeLocation,
@@ -139,9 +180,10 @@ class _NodeControlPageState extends State<NodeControlPage> {
   @override
   void dispose() {
     _pollingTimer?.cancel();
+    _enrollLinkChannel.setMethodCallHandler(null);
     _controlPlaneController.dispose();
     _jwtController.dispose();
-    _tokenController.dispose();
+    _joinTokenController.dispose();
     _labelsController.dispose();
     _externalMcpUrlController.dispose();
     _externalMcpNameController.dispose();
@@ -157,12 +199,15 @@ class _NodeControlPageState extends State<NodeControlPage> {
     final dataDir = '${appDir.path}/sam_data';
     final enrolled = _samLib.isEnrolled(dataDir);
     await _loadAttenuation(dataDir);
+    await _loadOrCreateApiToken(dataDir);
     final labelsFile = File('$dataDir/$_labelsFile');
     if (await labelsFile.exists()) {
       _labelsController.text = await labelsFile.readAsString();
     }
+    final joinedWithToken = await File('$dataDir/$_joinedWithTokenFile').exists();
     setState(() {
       _isEnrolled = enrolled;
+      _joinedWithToken = joinedWithToken;
       if (enrolled) {
         _status = 'Enrolled';
         // Try to get node ID if running (though might not be started yet)
@@ -191,6 +236,31 @@ class _NodeControlPageState extends State<NodeControlPage> {
     } catch (e) {
       debugPrint('DEBUG: Failed to read attenuation config: $e');
     }
+  }
+
+  Future<void> _loadOrCreateApiToken(String dataDir) async {
+    final file = File('$dataDir/$_apiTokenFile');
+    if (await file.exists()) {
+      final saved = (await file.readAsString()).trim();
+      if (saved.isNotEmpty) {
+        _apiToken = saved;
+        return;
+      }
+    }
+    await _writeApiToken(file, SamDartMcpServer.newToken());
+  }
+
+  Future<void> _writeApiToken(File file, String token) async {
+    await file.parent.create(recursive: true);
+    await file.writeAsString(token, flush: true);
+    _apiToken = token;
+  }
+
+  Future<void> _regenerateApiToken() async {
+    final appDir = await getApplicationDocumentsDirectory();
+    await _writeApiToken(
+        File('${appDir.path}/sam_data/$_apiTokenFile'), SamDartMcpServer.newToken());
+    if (mounted) setState(() {});
   }
 
   // The field keeps the CLI's old --labels wire format. Only the split lives
@@ -246,6 +316,20 @@ class _NodeControlPageState extends State<NodeControlPage> {
     return base64UrlEncode(values).replaceAll('=', '');
   }
 
+  // The OIDC paths need a control plane to ask for the issuer; there is no
+  // default one.
+  bool _requireControlPlaneUrl() {
+    final server = _controlPlaneController.text.trim();
+    if (isTrustedControlPlaneUrl(server)) return true;
+    setState(() {
+      _manualEntry = true;
+      _status = server.isEmpty
+          ? 'Enter the control plane URL first'
+          : 'Control plane URL must be https:// (plain http only for localhost)';
+    });
+    return false;
+  }
+
   String _generateCodeChallenge(String verifier) {
     final bytes = utf8.encode(verifier);
     final digest = sha256.convert(bytes);
@@ -254,6 +338,7 @@ class _NodeControlPageState extends State<NodeControlPage> {
 
   Future<void> _loginAndEnroll() async {
     debugPrint('DEBUG: _loginAndEnroll started');
+    if (!_requireControlPlaneUrl()) return;
     setState(() {
       _loggingIn = true;
       _status = 'Fetching control plane info...';
@@ -462,6 +547,7 @@ class _NodeControlPageState extends State<NodeControlPage> {
   }
 
   Future<void> _startDeviceLogin() async {
+    if (!_requireControlPlaneUrl()) return;
     setState(() {
       _loggingIn = true;
       _status = 'Fetching control plane info for device login...';
@@ -699,6 +785,147 @@ class _NodeControlPageState extends State<NodeControlPage> {
     });
   }
 
+  // ---- Token / QR enrollment -------------------------------------------
+
+  // Links arrive two ways: the one the activity was launched with (asked for
+  // once, after the enrollment state is known) and later ones pushed while
+  // the app is open.
+  Future<void> _listenForEnrollLinks() async {
+    _enrollLinkChannel.setMethodCallHandler((call) async {
+      if (call.method == 'onLink' && call.arguments is String) {
+        await _handleEnrollLink(call.arguments as String);
+      }
+    });
+    try {
+      final initial = await _enrollLinkChannel.invokeMethod<String>('getInitialLink');
+      if (initial != null) await _handleEnrollLink(initial);
+    } on MissingPluginException {
+      // Not on Android (tests, desktop): links only come from the scanner.
+    } catch (e) {
+      debugPrint('DEBUG: getInitialLink failed: $e');
+    }
+  }
+
+  Future<void> _scanEnrollCode() async {
+    final link = await Navigator.of(context).push<EnrollLink>(
+      MaterialPageRoute(builder: (_) => const ScanEnrollCodePage()),
+    );
+    if (link != null && mounted) await _confirmAndEnroll(link);
+  }
+
+  Future<void> _handleEnrollLink(String raw) async {
+    if (!mounted) return;
+    final link = parseEnrollLink(raw);
+    if (link == null) {
+      setState(() => _status = 'Ignored link: not a sam://enroll code');
+      return;
+    }
+    if (_isEnrolled == true) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Already enrolled. Unenroll first to join another mesh.')));
+      return;
+    }
+    await _confirmAndEnroll(link);
+  }
+
+  // The link came from a camera or another app: show where it leads before
+  // spending the single-use token on it.
+  Future<void> _confirmAndEnroll(EnrollLink link) async {
+    if (!mounted) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Join this mesh?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Control plane'),
+            SelectableText(link.server,
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            const Text('Enrollment token'),
+            Text(link.tokenHint,
+                style: const TextStyle(fontFamily: 'monospace')),
+            const SizedBox(height: 12),
+            const Text(
+              'Enrollment codes admit a limited number of devices for a '
+              'limited time. Labels from the Config tab are attested now.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Join')),
+        ],
+      ),
+    );
+    if (ok == true && mounted) await _enrollWithToken(link.server, link.token);
+  }
+
+  // Manual entry: the token field takes either a bare token (with the URL
+  // field naming the control plane) or a whole sam://enroll link.
+  Future<void> _joinWithToken() async {
+    final typed = _joinTokenController.text.trim();
+    if (typed.isEmpty) {
+      setState(() => _status = 'Enter an enrollment token or a sam://enroll link');
+      return;
+    }
+    final link = parseEnrollLink(typed);
+    if (link != null) {
+      _controlPlaneController.text = link.server;
+      await _enrollWithToken(link.server, link.token);
+      return;
+    }
+    final server = _controlPlaneController.text.trim();
+    if (!isTrustedControlPlaneUrl(server)) {
+      setState(() => _status =
+          'Control plane URL must be https:// (plain http only for localhost)');
+      return;
+    }
+    await _enrollWithToken(server, typed);
+  }
+
+  Future<void> _enrollWithToken(String server, String token) async {
+    final labelsText = _labelsController.text.trim();
+    final labels = _labelsOrReport(labelsText, 'Enrollment failed');
+    if (labels == null) return;
+    setState(() {
+      _loggingIn = true;
+      _status = 'Enrolling with token at ${Uri.parse(server).host}...';
+    });
+    final appDir = await getApplicationDocumentsDirectory();
+    final dataDir = '${appDir.path}/sam_data';
+    final err = await _isolatedEnrollBootstrap(dataDir, server, token, jsonEncode(labels));
+    if (err == null) {
+      await _saveLabels(dataDir, labelsText);
+      try {
+        await File('$dataDir/$_joinedWithTokenFile').create(recursive: true);
+      } catch (e) {
+        debugPrint('DEBUG: Failed to save join marker: $e');
+      }
+      _joinTokenController.clear();
+    }
+    if (!mounted) return;
+    setState(() {
+      _loggingIn = false;
+      if (err != null) {
+        _status = 'Enrollment failed: $err';
+      } else {
+        _controlPlaneController.text = server;
+        _status = 'Enrollment successful!';
+        _isEnrolled = true;
+        _joinedWithToken = true;
+      }
+    });
+  }
+
   // Silent path first: the refresh token saved at enrollment buys a JWT.
   // Any failure (none saved, expired, revoked) falls back to the browser.
   Future<void> _reEnroll() async {
@@ -792,7 +1019,7 @@ class _NodeControlPageState extends State<NodeControlPage> {
     // services are declared in the start configuration and probed at startup,
     // there is no runtime registration.
     try {
-      await _embeddedMcpServer.start(port: 9090);
+      await _embeddedMcpServer.start();
     } catch (e) {
       setState(() {
         _status = 'Start failed: embedded MCP server: $e';
@@ -806,7 +1033,7 @@ class _NodeControlPageState extends State<NodeControlPage> {
         'name': 'phone-sensors',
         'description':
             'Exposes phone sensors like battery and location to the SAM mesh',
-        'targetUrl': 'http://127.0.0.1:9090',
+        'targetUrl': _embeddedMcpServer.targetUrl,
       },
       if (_externalMcpUrlController.text.isNotEmpty &&
           _externalMcpNameController.text.isNotEmpty)
@@ -830,7 +1057,7 @@ class _NodeControlPageState extends State<NodeControlPage> {
       'controlPlaneURL': _controlPlaneController.text,
       'meshID': 'public-mesh',
       'bindAddr': '127.0.0.1:5005', // sidecar port inside phone
-      'apiToken': _tokenController.text,
+      'apiToken': _apiToken,
       'allowLoopback': true,
       'enableRelay': false,
       'labels': labels,
@@ -888,52 +1115,77 @@ class _NodeControlPageState extends State<NodeControlPage> {
   }
 
   Future<void> _unenroll() async {
-    final confirm = await showDialog<bool>(
+    final choice = await showDialog<_UnenrollChoice>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Unenroll Node'),
         content: const Text(
-            'Are you sure you want to unenroll? This will delete your local identity and disconnect you from the mesh.'),
+            'Unenroll disconnects this device from the mesh and deletes its '
+            'credentials. The PeerID is kept, so re-enrolling brings back the '
+            'same node.\n\n'
+            'Reset device identity also deletes the key behind the PeerID and '
+            'every local setting, so the next enrollment looks like a device '
+            'the mesh has never seen.'),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context, false),
+              onPressed: () => Navigator.pop(context),
               child: const Text('Cancel')),
           TextButton(
-            onPressed: () => Navigator.pop(context, true),
+            onPressed: () =>
+                Navigator.pop(context, _UnenrollChoice.resetIdentity),
+            child: const Text('Reset device identity',
+                style: TextStyle(color: Colors.red)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, _UnenrollChoice.unenroll),
             child: const Text('Unenroll', style: TextStyle(color: Colors.red)),
           ),
         ],
       ),
     );
 
-    if (confirm == true) {
-      if (_running) {
-        _stop();
-      }
-      final appDir = await getApplicationDocumentsDirectory();
-      final dataDir = '${appDir.path}/sam_data';
-      try {
+    if (choice == null) return;
+
+    // Closing the store here is what lets UnenrollNode take its file lock.
+    if (_running) {
+      _stop();
+    }
+    final appDir = await getApplicationDocumentsDirectory();
+    final dataDir = '${appDir.path}/sam_data';
+    try {
+      if (choice == _UnenrollChoice.resetIdentity) {
         final dir = Directory(dataDir);
         if (await dir.exists()) {
           await dir.delete(recursive: true);
         }
-        setState(() {
-          _isEnrolled = false;
-          _status = 'Unenrolled';
-          _nodeID = '';
-        });
-      } catch (e) {
-        setState(() {
-          _status = 'Failed to unenroll: $e';
-        });
+      } else {
+        final err = await _isolatedUnenroll(dataDir);
+        if (err != null) {
+          setState(() {
+            _status = 'Failed to unenroll: $err';
+          });
+          return;
+        }
       }
+      setState(() {
+        _isEnrolled = false;
+        _joinedWithToken = false;
+        _status = choice == _UnenrollChoice.resetIdentity
+            ? 'Device identity reset'
+            : 'Unenrolled (PeerID kept)';
+        _nodeID = '';
+      });
+    } catch (e) {
+      setState(() {
+        _status = 'Failed to unenroll: $e';
+      });
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('SAM Node Mobile')),
+      appBar: AppBar(title: const Text('SAM Connect')),
       body: _selectedTab == 0
           ? _buildBody()
           : _selectedTab == 1
@@ -1015,7 +1267,7 @@ class _NodeControlPageState extends State<NodeControlPage> {
                     ),
                     SwitchListTile(
                       title: const Text('Location'),
-                      subtitle: const Text('Share coarse location with mesh peers'),
+                      subtitle: const Text('Share approximate location (about 1 km) with mesh peers'),
                       value: _exposeLocation,
                       onChanged: (bool value) async {
                         setState(() {
@@ -1109,6 +1361,68 @@ class _NodeControlPageState extends State<NodeControlPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  const Text('Local API Token',
+                      style:
+                          TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Bearer token for the sidecar API on 127.0.0.1:5005. Any '
+                    'app on this phone that holds it can act as this node, '
+                    'so it is generated here and never a fixed value. '
+                    'Regenerating takes effect on the next Start.',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: SelectableText(
+                          _apiTokenVisible
+                              ? _apiToken
+                              : '\u2022' * 24,
+                          style: const TextStyle(
+                              fontFamily: 'monospace', fontSize: 13),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: _apiTokenVisible ? 'Hide' : 'Show',
+                        icon: Icon(_apiTokenVisible
+                            ? Icons.visibility_off
+                            : Icons.visibility),
+                        onPressed: () => setState(
+                            () => _apiTokenVisible = !_apiTokenVisible),
+                      ),
+                      IconButton(
+                        tooltip: 'Copy',
+                        icon: const Icon(Icons.copy),
+                        onPressed: () async {
+                          await Clipboard.setData(
+                              ClipboardData(text: _apiToken));
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                    content: Text('Token copied')));
+                          }
+                        },
+                      ),
+                      IconButton(
+                        tooltip: 'Regenerate',
+                        icon: const Icon(Icons.refresh),
+                        onPressed: isRunning ? null : _regenerateApiToken,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
                   const Text('Labels',
                       style:
                           TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
@@ -1130,7 +1444,9 @@ class _NodeControlPageState extends State<NodeControlPage> {
                   if (_isEnrolled == true) ...[
                     const SizedBox(height: 10),
                     ElevatedButton.icon(
-                      onPressed: _loggingIn || isRunning ? null : _reEnroll,
+                      onPressed: _loggingIn || isRunning || _joinedWithToken
+                          ? null
+                          : _reEnroll,
                       icon: _loggingIn
                           ? const SizedBox(
                               height: 20,
@@ -1139,6 +1455,14 @@ class _NodeControlPageState extends State<NodeControlPage> {
                           : const Icon(Icons.login),
                       label: const Text('Re-enroll to apply'),
                     ),
+                    if (_joinedWithToken)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 6),
+                        child: Text(
+                          'Joined with a token. Unenroll and join again to change labels.',
+                          style: TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                      ),
                   ],
                 ],
               ),
@@ -1218,7 +1542,11 @@ class _NodeControlPageState extends State<NodeControlPage> {
     );
   }
 
+  // Landing screen. The primary path is the QR code a control plane prints
+  // (sam-one's terminal, `sam-one token qr`); everything else sits behind
+  // "Enter details manually": a bootstrap token, or the OIDC logins.
   Widget _buildEnrollmentView() {
+    final busy = _loggingIn;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16.0),
       child: Column(
@@ -1227,48 +1555,113 @@ class _NodeControlPageState extends State<NodeControlPage> {
           const Text('Welcome to SAM',
               style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
               textAlign: TextAlign.center),
-          const SizedBox(height: 20),
-          const Text('Please enroll your node to join the mesh.',
-              textAlign: TextAlign.center),
-          const SizedBox(height: 30),
-          TextField(
-            controller: _controlPlaneController,
-            // A pasted URL often carries a trailing space or newline.
-            inputFormatters: [FilteringTextInputFormatter.deny(RegExp(r'\s'))],
-            decoration: const InputDecoration(
-              labelText: 'Control plane URL',
-              border: OutlineInputBorder(),
-              hintText: 'https://bananas.sam-mesh.dev',
-            ),
+          const SizedBox(height: 12),
+          const Text(
+            'Join a mesh by scanning the enrollment code shown by its control plane.',
+            textAlign: TextAlign.center,
           ),
-          const SizedBox(height: 20),
-          ElevatedButton.icon(
-            onPressed: _loggingIn ? null : _loginAndEnroll,
-            icon: _loggingIn
+          const SizedBox(height: 24),
+          FilledButton.icon(
+            onPressed: busy ? null : _scanEnrollCode,
+            icon: busy
                 ? const SizedBox(
                     height: 20,
                     width: 20,
                     child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.login),
-            label: const Text('Login & Enroll (Browser)'),
-            style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(vertical: 16)),
+                : const Icon(Icons.qr_code_scanner),
+            label: const Text('Scan enrollment code'),
+            style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 18)),
           ),
-          const SizedBox(height: 10),
-          ElevatedButton.icon(
-            onPressed: _loggingIn ? null : _startDeviceLogin,
-            icon: const Icon(Icons.tv),
-            label: const Text('Device Login (TV / Other Device)'),
-            style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(vertical: 16)),
-          ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 8),
           const Text(
-            'Set labels on the Config tab before enrolling.',
+            'Opening a sam://enroll link from another app works too.',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 12, color: Colors.grey),
           ),
-          const SizedBox(height: 30),
+          const SizedBox(height: 16),
+          TextButton.icon(
+            onPressed: busy
+                ? null
+                : () => setState(() => _manualEntry = !_manualEntry),
+            icon: Icon(_manualEntry ? Icons.expand_less : Icons.expand_more),
+            label: Text(_manualEntry
+                ? 'Hide manual entry'
+                : 'Enter details manually'),
+          ),
+          if (_manualEntry) ...[
+            const SizedBox(height: 8),
+            TextField(
+              controller: _controlPlaneController,
+              enabled: !busy,
+              // A pasted URL often carries a trailing space or newline.
+              inputFormatters: [FilteringTextInputFormatter.deny(RegExp(r'\s'))],
+              decoration: const InputDecoration(
+                labelText: 'Control plane URL',
+                border: OutlineInputBorder(),
+                hintText: 'https://mesh.example.com',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _joinTokenController,
+              enabled: !busy,
+              inputFormatters: [FilteringTextInputFormatter.deny(RegExp(r'\s'))],
+              onChanged: (text) {
+                // A pasted sam://enroll link names the control plane itself.
+                final link = parseEnrollLink(text);
+                if (link != null && _controlPlaneController.text != link.server) {
+                  setState(() => _controlPlaneController.text = link.server);
+                }
+              },
+              decoration: const InputDecoration(
+                labelText: 'Enrollment token',
+                border: OutlineInputBorder(),
+                hintText: 'sam_dev_… or a sam://enroll link',
+              ),
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton.icon(
+              onPressed: busy ? null : _joinWithToken,
+              icon: const Icon(Icons.vpn_key),
+              label: const Text('Join with token'),
+              style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 16)),
+            ),
+            const SizedBox(height: 20),
+            const Row(children: [
+              Expanded(child: Divider()),
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                child: Text('or sign in',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+              ),
+              Expanded(child: Divider()),
+            ]),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: busy ? null : _loginAndEnroll,
+              icon: const Icon(Icons.login),
+              label: const Text('Login & Enroll (Browser)'),
+              style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 16)),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: busy ? null : _startDeviceLogin,
+              icon: const Icon(Icons.tv),
+              label: const Text('Device Login (TV / Other Device)'),
+              style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 16)),
+            ),
+          ],
+          const SizedBox(height: 16),
+          const Text(
+            'Labels are attested at enrollment; set them on the Config tab first.',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+          const SizedBox(height: 24),
           if (_status.isNotEmpty &&
               _status != 'Enrolled' &&
               _status != 'Unenrolled')
@@ -1276,31 +1669,8 @@ class _NodeControlPageState extends State<NodeControlPage> {
               color: Colors.grey.shade100,
               child: Padding(
                 padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  children: [
-                    Text('Status: $_status',
-                        style: const TextStyle(fontStyle: FontStyle.italic)),
-                    const SizedBox(height: 10),
-                    ElevatedButton(
-                      onPressed: () async {
-                        try {
-                          final model = FirebaseAI.googleAI().generativeModel(
-                            model: 'gemini-2.5-flash',
-                          );
-                          debugPrint('DEBUG: Model initialized: ${model.hashCode}');
-                          setState(() {
-                            _status = 'Debug: Model initialized';
-                          });
-                        } catch (e) {
-                          setState(() {
-                            _status = 'API Error: $e';
-                          });
-                        }
-                      },
-                      child: const Text('Debug API Connection'),
-                    ),
-                  ],
-                ),
+                child: Text('Status: $_status',
+                    style: const TextStyle(fontStyle: FontStyle.italic)),
               ),
             ),
         ],

@@ -16,10 +16,11 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -51,17 +52,20 @@ type baseService struct {
 // newReverseProxyHandler builds a single-host reverse-proxy handler for a
 // URL backend. Same code path as today's URL branch in RegisterService.
 func newReverseProxyHandler(targetURL string) (http.Handler, error) {
-	u, err := url.Parse(targetURL)
+	target, err := parseBackendTarget(targetURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid target URL: %w", err)
+		return nil, err
 	}
+	u := target.url
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			noTrailingSlash := pr.In.Header.Get(api.HeaderSamNoTrailingSlash) == "true"
 			pr.SetURL(u)
-			// Preserve the Host behavior of NewSingleHostReverseProxy.
-			pr.Out.Host = pr.In.Host
+			// The inbound Host is whatever the remote peer sent; the backend
+			// is addressed by its configured URL.
+			pr.Out.Host = u.Host
 			pr.Out.Header.Del(api.HeaderSamNoTrailingSlash)
+			target.apply(pr.Out.Header)
 			if noTrailingSlash && !strings.HasSuffix(u.Path, "/") && strings.HasSuffix(pr.Out.URL.Path, "/") {
 				pr.Out.URL.Path = strings.TrimSuffix(pr.Out.URL.Path, "/")
 			}
@@ -99,12 +103,17 @@ func (b *baseService) Init(ctx context.Context) error {
 	return nil
 }
 
-// Teardown kills the command backend's process, if any.
+// Teardown kills the command backend's process, if any. The bridge's stdout
+// reader reaps it, and has already done so for a backend that exited on its
+// own, so an already-finished process is not an error.
 func (b *baseService) Teardown() error {
 	if b.cmd == nil || b.cmd.Process == nil {
 		return nil
 	}
-	return b.cmd.Process.Kill()
+	if err := b.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
 }
 
 func NewServiceFromRequest(req *api.RegisterServiceRequest) (Service, error) {
@@ -142,7 +151,14 @@ func buildRegisterRequest(sCfg api.ServiceConfig) (*api.RegisterServiceRequest, 
 	}
 	switch {
 	case sCfg.TargetURL != "":
-		req.Backend = &api.RegisterServiceRequest_TargetUrl{TargetUrl: sCfg.TargetURL}
+		target := sCfg.TargetURL
+		if sCfg.TargetAuthPath != "" {
+			var err error
+			if target, err = withBackendAuthFile(target, sCfg.TargetAuthPath); err != nil {
+				return nil, fmt.Errorf("service %s: %w", sCfg.Name, err)
+			}
+		}
+		req.Backend = &api.RegisterServiceRequest_TargetUrl{TargetUrl: target}
 	case len(sCfg.Command) > 0:
 		req.Backend = &api.RegisterServiceRequest_Command{
 			Command: &api.CommandBackend{

@@ -1,6 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
@@ -10,10 +9,17 @@
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+    <!-- Scanning the sam://enroll QR code shown by the control plane. -->
+    <uses-permission android:name="android.permission.CAMERA"/>
     <application
-        android:label="sam_agent"
+        android:label="SAM Connect"
         android:name=".SamApplication"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false">
+        <!-- allowBackup=false: app data holds the node's private key, its
+             biscuit and the local API token; none of it belongs in a cloud or
+             adb backup, and a restore onto another device would clone the
+             identity. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -31,9 +37,23 @@
               android:name="io.flutter.embedding.android.NormalTheme"
               android:resource="@style/NormalTheme"
               />
+            <!-- sam://enroll links are handled by MainActivity's enroll_link
+                 channel; without this the engine also pushes them as a
+                 Navigator route, which MaterialApp has no page for. -->
+            <meta-data
+              android:name="flutter_deeplinking_enabled"
+              android:value="false" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <!-- sam://enroll?server=...&token=... links: a stock camera app
+                 scanning the enrollment QR hands the payload to this app. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="sam" android:host="enroll"/>
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.
@@ -47,7 +67,7 @@
         <property
             android:name="android.app.appfunctions.app_function_schema_version"
             android:value="1" />
-    <!-- Foreground Service for keeping SAM Node alive -->
+    <!-- Foreground Service that keeps the SAM Connect node alive -->
         <service 
             android:name=".SamNodeForegroundService"
             android:foregroundServiceType="connectedDevice|location"
